@@ -215,6 +215,13 @@ static uint32_t apply_usbd_profile_player(const input_event_t* event, profile_ou
         profile_out->l2_analog, profile_out->r2_analog,
         profile_out->rz_analog
     };
+
+    // TRACE: confirm what the web-UI merged display actually receives
+    printf("[usbd] cdc tx player=%d: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+           player_index,
+           output_axes[0], output_axes[1], output_axes[2], output_axes[3],
+           (unsigned long)profile_out->buttons);
+
     cdc_commands_send_player_output(player_index, profile_out->buttons, output_axes);
 
     return profile_out->buttons;
@@ -525,6 +532,13 @@ static void usbd_on_input(output_target_t output, uint8_t player_index, const in
     if (player_index >= USB_MAX_PLAYERS || !event) {
         return;
     }
+
+    // TRACE: confirm what the router handed us
+    printf("[usbd] tap rx player=%d: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+           player_index,
+           event->analog[ANALOG_LX], event->analog[ANALOG_LY],
+           event->analog[ANALOG_RX], event->analog[ANALOG_RY],
+           (unsigned long)event->buttons);
 
     // Queue the event for sending when USB is ready
     pending_events[player_index] = *event;
