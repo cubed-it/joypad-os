@@ -282,36 +282,28 @@ static bool switch_init(bthid_device_t* device)
             init_input_event(&switch_data[i].event);
             switch_data[i].initialized = true;
             switch_data[i].full_report_mode = false;
-            // Detect single Joy-Con L/R.
-            //
-            // PID-based detection is preferred (definitive) but usually
-            // fails at this point: for Classic-BT-HID devices the SDP
-            // VID/PID query is deferred until AFTER bthid->init runs
-            // (see btstack_host.c, where bt_on_hid_ready() is called
-            // before the SDP query is fired), so vendor_id/product_id
-            // are still 0 here. bthid_update_device_info() does NOT
-            // re-init vendor drivers that still match by name, so the
-            // grip_side set here is the one that sticks for the lifetime
-            // of the connection.
-            //
-            // Workaround: also try the device name. Joy-Cons advertise
-            // "Joy-Con (L)" / "Joy-Con (R)" in their Classic-BT name, so
-            // the side is reliably detectable even before SDP completes.
-            // Pro Controllers and unknown devices stay at -1 (all sticks
-            // valid, no d-pad stripping). Switch 2 controllers are
-            // matched by the switch2_ble driver and never reach this
-            // init.
-            if (device->vendor_id == 0x057E && device->product_id == 0x2006) {
-                switch_data[i].grip_side = 0;  // Joy-Con L (PID)
-            } else if (device->vendor_id == 0x057E && device->product_id == 0x2007) {
-                switch_data[i].grip_side = 1;  // Joy-Con R (PID)
-            } else if (device->name && strstr(device->name, "Joy-Con (L)")) {
-                switch_data[i].grip_side = 0;  // Joy-Con L (name)
-            } else if (device->name && strstr(device->name, "Joy-Con (R)")) {
-                switch_data[i].grip_side = 1;  // Joy-Con R (name)
-            } else {
-                switch_data[i].grip_side = -1;
-            }
+// Detect single Joy-Con L/R.
+//
+// We CANNOT tell L from R at init time. PID-based detection is
+// unreliable: (a) the SDP VID/PID query is deferred until AFTER
+// bthid->init runs for Classic-BT-HID devices (see btstack_host.c —
+// bt_on_hid_ready() is called before the SDP query is fired), so
+// vendor_id/product_id are typically still 0 here; and (b) standalone
+// Joy-Cons in Classic-BT mode BOTH advertise as PID 0x2006 (the Switch
+// console distinguishes L/R by BD_ADDR, not PID). The BT name suffix
+// "(L)"/"(R)" is also not reliably present in the advertised EIR name.
+//
+// Detection is therefore deferred to the first HID report — see
+// switch_process_report, which classifies the side from the report
+// content (the non-physical stick is filled with raw-zero values for
+// both axes). This mirrors the USB Joy-Con Charging Grip driver
+// (switch_pro.c), which does the same classification on the first
+// 0x30/0x21 report.
+//
+// Pro Controllers have data on both sticks and stay at grip_side=-1
+// ("all fields valid" — legacy behaviour). Switch 2 controllers are
+// matched by the switch2_ble driver and never reach this init.
+            switch_data[i].grip_side = -1;
             switch_data[i].output_seq = 0;
             switch_data[i].rumble_left = 0;
             switch_data[i].rumble_right = 0;
@@ -338,18 +330,6 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
 {
     switch_bt_data_t* sw = (switch_bt_data_t*)device->driver_data;
     if (!sw || len < 1) return;
-
-    // Safety net: PID-based side detection may have failed at init
-    // (SDP query runs after bthid->init for Classic-BT-HID devices).
-    // Retry once now that HID reports are flowing — by the time we
-    // receive input the SDP query has long since completed.
-    if (sw->grip_side == -1 && device->product_id != 0) {
-        if (device->vendor_id == 0x057E && device->product_id == 0x2006) {
-            sw->grip_side = 0;
-        } else if (device->vendor_id == 0x057E && device->product_id == 0x2007) {
-            sw->grip_side = 1;
-        }
-    }
 
     uint8_t report_id = data[0];
 
@@ -418,6 +398,33 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         uint16_t rx = unpack_stick_12bit(rpt->right_stick, false);
         uint16_t ry = unpack_stick_12bit(rpt->right_stick, true);
 
+        // Side detection from report content (one-shot, on the first
+        // report). Both standalone Joy-Cons advertise PID 0x2006 in
+        // Classic-BT mode, so PID-based detection cannot tell L from R.
+        // The non-physical stick is filled with raw-zero 12-bit values
+        // for both axes — the physical stick reports real values
+        // (≥~2048 at rest). This matches the USB Joy-Con Charging Grip
+        // driver (switch_pro.c:376-386), which uses the same signal.
+        // If both sticks report data, this is a Pro Controller and we
+        // stay at grip_side=-1 ("all valid" mask). If both sticks are
+        // zero, we wait for a later report (the user might be holding
+        // a centered physical stick on first contact, but the
+        // non-physical stick is constant, so the asymmetry will appear
+        // as soon as the user touches the physical one).
+        if (sw->grip_side == -1) {
+            bool r_empty = (rx == 0 && ry == 0);
+            bool l_empty = (lx == 0 && ly == 0);
+            if (r_empty && !l_empty) {
+                sw->grip_side = 0;  // Right stick empty → Joy-Con L
+            } else if (l_empty && !r_empty) {
+                sw->grip_side = 1;  // Left stick empty → Joy-Con R
+            }
+            if (sw->grip_side != -1) {
+                printf("[SWITCH_BT] Grip side detected from report: %s (raw L=%u/%u R=%u/%u)\n",
+                       sw->grip_side == 0 ? "L" : "R", lx, ly, rx, ry);
+            }
+        }
+
         // Scale to 8-bit and invert Y (Nintendo: up=high, HID: up=low)
         sw->event.analog[ANALOG_LX] = scale_12bit_to_8bit(lx);
         sw->event.analog[ANALOG_LY] = 255 - scale_12bit_to_8bit(ly);
@@ -479,6 +486,27 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         if (sw->grip_side == 1) {
             sw->event.buttons &= ~(JP_BUTTON_DU | JP_BUTTON_DD |
                                    JP_BUTTON_DL | JP_BUTTON_DR);
+        }
+
+        // Side detection from report content (one-shot, on the first
+        // simple report). Same logic as the 0x30 path: the non-physical
+        // stick is raw-zero in both axes; the physical stick reports
+        // real 16-bit values (≥~32768 at rest). 0x3F reports arrive
+        // before SET_INPUT_MODE completes, so this can detect the side
+        // a few hundred ms earlier than waiting for 0x30.
+        if (sw->grip_side == -1) {
+            bool r_empty = (rpt->rx == 0 && rpt->ry == 0);
+            bool l_empty = (rpt->lx == 0 && rpt->ly == 0);
+            if (r_empty && !l_empty) {
+                sw->grip_side = 0;  // Joy-Con L
+            } else if (l_empty && !r_empty) {
+                sw->grip_side = 1;  // Joy-Con R
+            }
+            if (sw->grip_side != -1) {
+                printf("[SWITCH_BT] Grip side detected from 0x3F: %s (raw L=%u/%u R=%u/%u)\n",
+                       sw->grip_side == 0 ? "L" : "R",
+                       rpt->lx, rpt->ly, rpt->rx, rpt->ry);
+            }
         }
 
         // Per-event field ownership. Buttons are always "valid" as a
