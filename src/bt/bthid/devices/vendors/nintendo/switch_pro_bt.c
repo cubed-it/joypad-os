@@ -379,39 +379,21 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
 
         sw->event.buttons = buttons;
 
-        // R Joy-Con has no physical d-pad. The HID report can still
-        // carry non-zero d-pad bits (some firmware versions, or when
-        // the host has remapped SR + stick to d-pad). Clear them from
-        // the event so a paired L Joy-Con is the only source of
-        // DU/DD/DL/DR. The clear MUST happen after the assignment to
-        // sw->event.buttons (not before) — clearing before the d-pad
-        // block above is a no-op because the block OR-sets the bits
-        // back in.
-        // R Joy-Con has no physical d-pad — single R in horizontal mode
-        // encodes stick movement as d-pad bits, and even at "center"
-        // it often reports a phantom DD+DL default state. Strip them so
-        // only L (the actual d-pad source) contributes to merged
-        // d-pad, then re-inject the bits as digital RX/RY axes below
-        // so R's stick still drives the right-stick slot.
+        // Capture d-pad bits BEFORE the R-side strip so the axis
+        // conversion below can see them. R in horizontal mode encodes
+        // stick movement as d-pad bits (and reports a phantom DD+DL
+        // default at "center"); we want only L to contribute merged
+        // d-pad, but we also want R's stick-as-d-pad to drive the
+        // right-stick slot as RX/RY axes. The conversion happens after
+        // the HID scaling further below — see the comment near it.
+        uint32_t r_dpad_for_axes = 0;
         if (sw->grip_side == 1) {
+            r_dpad_for_axes = sw->event.buttons &
+                              (JP_BUTTON_DU | JP_BUTTON_DD |
+                               JP_BUTTON_DL | JP_BUTTON_DR);
+            // Strip so only L contributes merged d-pad.
             sw->event.buttons &= ~(JP_BUTTON_DU | JP_BUTTON_DD |
                                    JP_BUTTON_DL | JP_BUTTON_DR);
-            // Re-inject d-pad bits (now stripped from buttons) as
-            // digital RX/RY. 4-way only — no analog precision, but
-            // every direction works. Skipped when no d-pad bits are
-            // set (vertical-mode normal Joy-Con, idle at center →
-            // leave the centered axis values the driver already
-            // wrote).
-            if (sw->event.buttons & (JP_BUTTON_DU | JP_BUTTON_DD |
-                                     JP_BUTTON_DL | JP_BUTTON_DR)) {
-                uint8_t ax = 128, ay = 128;
-                if (sw->event.buttons & JP_BUTTON_DR) ax = 255;
-                else if (sw->event.buttons & JP_BUTTON_DL) ax = 0;
-                if (sw->event.buttons & JP_BUTTON_DD) ay = 255;
-                else if (sw->event.buttons & JP_BUTTON_DU) ay = 0;
-                sw->event.analog[ANALOG_RX] = ax;
-                sw->event.analog[ANALOG_RY] = ay;
-            }
         }
 
         // Unpack 12-bit sticks
@@ -452,6 +434,25 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         sw->event.analog[ANALOG_LY] = 255 - scale_12bit_to_8bit(ly);
         sw->event.analog[ANALOG_RX] = scale_12bit_to_8bit(rx);
         sw->event.analog[ANALOG_RY] = 255 - scale_12bit_to_8bit(ry);
+
+        // Override R's RX/RY with d-pad→axis conversion if we captured
+        // d-pad bits above. R in horizontal mode reports its stick as
+        // d-pad bits, and the HID raw-stick field stays centered at 128,
+        // so the HID scaling just wrote 128/128 — overwrite that with
+        // the digital 4-way conversion derived from the saved bits.
+        // (We use the captured copy because the strip above already
+        // cleared the bits from event.buttons.) 4-way only — no
+        // analog precision. Skipped if no d-pad bits were captured
+        // (vertical-mode normal Joy-Con → leave the HID scaling alone).
+        if (r_dpad_for_axes) {
+            uint8_t ax = 128, ay = 128;
+            if (r_dpad_for_axes & JP_BUTTON_DR) ax = 255;
+            else if (r_dpad_for_axes & JP_BUTTON_DL) ax = 0;
+            if (r_dpad_for_axes & JP_BUTTON_DD) ay = 255;
+            else if (r_dpad_for_axes & JP_BUTTON_DU) ay = 0;
+            sw->event.analog[ANALOG_RX] = ax;
+            sw->event.analog[ANALOG_RY] = ay;
+        }
 
         // Mark only the owned stick as valid for this event. d-pad
         // ownership was enforced above (R has d-pad bits stripped
@@ -515,28 +516,17 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
 
         sw->event.buttons = buttons;
 
-        // R Joy-Con has no physical d-pad in the simple report either.
-        // Clear from the event AFTER the hat-to-dpad mapping above, so
-        // a paired L Joy-Con is the only source of DU/DD/DL/DR.
+        // Capture d-pad bits BEFORE the R-side strip so the axis
+        // conversion below can use them. See the matching block in
+        // the 0x30 path above for the full reasoning.
+        uint32_t r_dpad_for_axes = 0;
         if (sw->grip_side == 1) {
+            r_dpad_for_axes = sw->event.buttons &
+                              (JP_BUTTON_DU | JP_BUTTON_DD |
+                               JP_BUTTON_DL | JP_BUTTON_DR);
+            // Strip so only L contributes merged d-pad.
             sw->event.buttons &= ~(JP_BUTTON_DU | JP_BUTTON_DD |
                                    JP_BUTTON_DL | JP_BUTTON_DR);
-
-            // Same horizontal-mode workaround as the 0x30 path: single R
-            // Joy-Con encodes stick movement as the hat / d-pad bits
-            // (stripped above). Re-inject them as digital RX/RY so the
-            // merged player slot still has a usable right stick. 4-way
-            // digital only.
-            if (sw->event.buttons & (JP_BUTTON_DU | JP_BUTTON_DD |
-                                     JP_BUTTON_DL | JP_BUTTON_DR)) {
-                uint8_t ax = 128, ay = 128;
-                if (sw->event.buttons & JP_BUTTON_DR) ax = 255;
-                else if (sw->event.buttons & JP_BUTTON_DL) ax = 0;
-                if (sw->event.buttons & JP_BUTTON_DD) ay = 255;
-                else if (sw->event.buttons & JP_BUTTON_DU) ay = 0;
-                sw->event.analog[ANALOG_RX] = ax;
-                sw->event.analog[ANALOG_RY] = ay;
-            }
         }
 
         // Side detection from report content (one-shot, on the first
@@ -576,6 +566,20 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         sw->event.analog[ANALOG_LY] = 255 - (rpt->ly >> 8);  // Invert Y (Nintendo: up=high, HID: up=low)
         sw->event.analog[ANALOG_RX] = rpt->rx >> 8;
         sw->event.analog[ANALOG_RY] = 255 - (rpt->ry >> 8);  // Invert Y (Nintendo: up=high, HID: up=low)
+
+        // Same override as in the 0x30 path above — replace the
+        // HID-scaled RX/RY (centered at 128 for R in horizontal mode)
+        // with the digital 4-way conversion from the captured d-pad
+        // bits. 4-way only.
+        if (r_dpad_for_axes) {
+            uint8_t ax = 128, ay = 128;
+            if (r_dpad_for_axes & JP_BUTTON_DR) ax = 255;
+            else if (r_dpad_for_axes & JP_BUTTON_DL) ax = 0;
+            if (r_dpad_for_axes & JP_BUTTON_DD) ay = 255;
+            else if (r_dpad_for_axes & JP_BUTTON_DU) ay = 0;
+            sw->event.analog[ANALOG_RX] = ax;
+            sw->event.analog[ANALOG_RY] = ay;
+        }
 
         // Same throttled heartbeat for the 0x3F simple-report path so we
         // can see whether the device ever transitions out of init mode.
