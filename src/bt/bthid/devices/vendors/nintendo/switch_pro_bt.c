@@ -282,14 +282,33 @@ static bool switch_init(bthid_device_t* device)
             init_input_event(&switch_data[i].event);
             switch_data[i].initialized = true;
             switch_data[i].full_report_mode = false;
-            // Detect single Joy-Con L/R from PID. Pro Controllers and
-            // unknown devices stay at -1 (all sticks valid, no d-pad
-            // stripping). Switch 2 controllers are matched by the
-            // switch2_ble driver and never reach this init.
+            // Detect single Joy-Con L/R.
+            //
+            // PID-based detection is preferred (definitive) but usually
+            // fails at this point: for Classic-BT-HID devices the SDP
+            // VID/PID query is deferred until AFTER bthid->init runs
+            // (see btstack_host.c, where bt_on_hid_ready() is called
+            // before the SDP query is fired), so vendor_id/product_id
+            // are still 0 here. bthid_update_device_info() does NOT
+            // re-init vendor drivers that still match by name, so the
+            // grip_side set here is the one that sticks for the lifetime
+            // of the connection.
+            //
+            // Workaround: also try the device name. Joy-Cons advertise
+            // "Joy-Con (L)" / "Joy-Con (R)" in their Classic-BT name, so
+            // the side is reliably detectable even before SDP completes.
+            // Pro Controllers and unknown devices stay at -1 (all sticks
+            // valid, no d-pad stripping). Switch 2 controllers are
+            // matched by the switch2_ble driver and never reach this
+            // init.
             if (device->vendor_id == 0x057E && device->product_id == 0x2006) {
-                switch_data[i].grip_side = 0;  // Joy-Con L
+                switch_data[i].grip_side = 0;  // Joy-Con L (PID)
             } else if (device->vendor_id == 0x057E && device->product_id == 0x2007) {
-                switch_data[i].grip_side = 1;  // Joy-Con R
+                switch_data[i].grip_side = 1;  // Joy-Con R (PID)
+            } else if (device->name && strstr(device->name, "Joy-Con (L)")) {
+                switch_data[i].grip_side = 0;  // Joy-Con L (name)
+            } else if (device->name && strstr(device->name, "Joy-Con (R)")) {
+                switch_data[i].grip_side = 1;  // Joy-Con R (name)
             } else {
                 switch_data[i].grip_side = -1;
             }
@@ -319,6 +338,18 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
 {
     switch_bt_data_t* sw = (switch_bt_data_t*)device->driver_data;
     if (!sw || len < 1) return;
+
+    // Safety net: PID-based side detection may have failed at init
+    // (SDP query runs after bthid->init for Classic-BT-HID devices).
+    // Retry once now that HID reports are flowing — by the time we
+    // receive input the SDP query has long since completed.
+    if (sw->grip_side == -1 && device->product_id != 0) {
+        if (device->vendor_id == 0x057E && device->product_id == 0x2006) {
+            sw->grip_side = 0;
+        } else if (device->vendor_id == 0x057E && device->product_id == 0x2007) {
+            sw->grip_side = 1;
+        }
+    }
 
     uint8_t report_id = data[0];
 
