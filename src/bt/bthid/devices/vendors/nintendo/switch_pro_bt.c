@@ -387,9 +387,31 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         // sw->event.buttons (not before) — clearing before the d-pad
         // block above is a no-op because the block OR-sets the bits
         // back in.
+        // R Joy-Con has no physical d-pad — single R in horizontal mode
+        // encodes stick movement as d-pad bits, and even at "center"
+        // it often reports a phantom DD+DL default state. Strip them so
+        // only L (the actual d-pad source) contributes to merged
+        // d-pad, then re-inject the bits as digital RX/RY axes below
+        // so R's stick still drives the right-stick slot.
         if (sw->grip_side == 1) {
             sw->event.buttons &= ~(JP_BUTTON_DU | JP_BUTTON_DD |
                                    JP_BUTTON_DL | JP_BUTTON_DR);
+            // Re-inject d-pad bits (now stripped from buttons) as
+            // digital RX/RY. 4-way only — no analog precision, but
+            // every direction works. Skipped when no d-pad bits are
+            // set (vertical-mode normal Joy-Con, idle at center →
+            // leave the centered axis values the driver already
+            // wrote).
+            if (sw->event.buttons & (JP_BUTTON_DU | JP_BUTTON_DD |
+                                     JP_BUTTON_DL | JP_BUTTON_DR)) {
+                uint8_t ax = 128, ay = 128;
+                if (sw->event.buttons & JP_BUTTON_DR) ax = 255;
+                else if (sw->event.buttons & JP_BUTTON_DL) ax = 0;
+                if (sw->event.buttons & JP_BUTTON_DD) ay = 255;
+                else if (sw->event.buttons & JP_BUTTON_DU) ay = 0;
+                sw->event.analog[ANALOG_RX] = ax;
+                sw->event.analog[ANALOG_RY] = ay;
+            }
         }
 
         // Unpack 12-bit sticks
@@ -449,6 +471,19 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         sw->event.battery_level = (bat_raw > 8) ? 100 : bat_raw * 12 + 5;
         sw->event.battery_charging = (rpt->battery_conn & 0x08) != 0;
 
+        // Debug: throttled heartbeat per Joy-Con so we can see the live
+        // stick values + active mask in the serial log. Every 64th report
+        // = ~1 Hz at the 66 Hz full-report rate, no flood.
+        static uint32_t dbg_count_30 = 0;
+        if ((dbg_count_30++ & 63) == 0) {
+            printf("[SWITCH_BT] 0x30 dev=%d side=%d mask=0x%X "
+                   "LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+                   device->conn_index, sw->grip_side, sw->event.valid_fields,
+                   sw->event.analog[ANALOG_LX], sw->event.analog[ANALOG_LY],
+                   sw->event.analog[ANALOG_RX], sw->event.analog[ANALOG_RY],
+                   (unsigned long)sw->event.buttons);
+        }
+
         router_submit_input(&sw->event);
 
     } else if (report_id == SWITCH_REPORT_INPUT_SIMPLE && len >= 12) {
@@ -486,6 +521,22 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         if (sw->grip_side == 1) {
             sw->event.buttons &= ~(JP_BUTTON_DU | JP_BUTTON_DD |
                                    JP_BUTTON_DL | JP_BUTTON_DR);
+
+            // Same horizontal-mode workaround as the 0x30 path: single R
+            // Joy-Con encodes stick movement as the hat / d-pad bits
+            // (stripped above). Re-inject them as digital RX/RY so the
+            // merged player slot still has a usable right stick. 4-way
+            // digital only.
+            if (sw->event.buttons & (JP_BUTTON_DU | JP_BUTTON_DD |
+                                     JP_BUTTON_DL | JP_BUTTON_DR)) {
+                uint8_t ax = 128, ay = 128;
+                if (sw->event.buttons & JP_BUTTON_DR) ax = 255;
+                else if (sw->event.buttons & JP_BUTTON_DL) ax = 0;
+                if (sw->event.buttons & JP_BUTTON_DD) ay = 255;
+                else if (sw->event.buttons & JP_BUTTON_DU) ay = 0;
+                sw->event.analog[ANALOG_RX] = ax;
+                sw->event.analog[ANALOG_RY] = ay;
+            }
         }
 
         // Side detection from report content (one-shot, on the first
@@ -525,6 +576,18 @@ static void switch_process_report(bthid_device_t* device, const uint8_t* data, u
         sw->event.analog[ANALOG_LY] = 255 - (rpt->ly >> 8);  // Invert Y (Nintendo: up=high, HID: up=low)
         sw->event.analog[ANALOG_RX] = rpt->rx >> 8;
         sw->event.analog[ANALOG_RY] = 255 - (rpt->ry >> 8);  // Invert Y (Nintendo: up=high, HID: up=low)
+
+        // Same throttled heartbeat for the 0x3F simple-report path so we
+        // can see whether the device ever transitions out of init mode.
+        static uint32_t dbg_count_3f = 0;
+        if ((dbg_count_3f++ & 63) == 0) {
+            printf("[SWITCH_BT] 0x3F dev=%d side=%d mask=0x%X "
+                   "LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+                   device->conn_index, sw->grip_side, sw->event.valid_fields,
+                   sw->event.analog[ANALOG_LX], sw->event.analog[ANALOG_LY],
+                   sw->event.analog[ANALOG_RX], sw->event.analog[ANALOG_RY],
+                   (unsigned long)sw->event.buttons);
+        }
 
         router_submit_input(&sw->event);
     }
