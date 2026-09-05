@@ -887,7 +887,12 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
 
     // Build the merged result in a local, then publish once (seqlock) so Core 1
     // never sees a torn frame mid-blend. See output_state_t doc in router.h.
+    // Initialize defensively — the MERGE_BLEND path may skip slot setup
+    // (no free slot, or no active devices) and we still reference merged
+    // for the tap callback below.
     input_event_t merged;
+    init_input_event(&merged);
+    bool merged_valid = false;
 
     switch (router_config.merge_mode) {
         case MERGE_ALL: {
@@ -910,9 +915,11 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                         merged.analog[j] = final_event->analog[j];
                     }
                 }
+                merged_valid = true;
             } else {
                 // Legacy: full overwrite (every field treated as valid).
                 merged = *final_event;
+                merged_valid = true;
             }
             break;
         }
@@ -1148,6 +1155,7 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                     x_current_state.has_motion = true;
                 }
                 merged = x_current_state;
+                merged_valid = true;
 
                 // TRACE: final merged result before publish
                 printf(LOG_TAG "  → merge result: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
@@ -1168,6 +1176,7 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                 // USB has highest priority (0), always wins
                 merged = *final_event;
             }
+            merged_valid = true;
             // Lower priority sources only update if no USB input active
             // TODO: Track activity timeout for priority fallback
             break;
@@ -1177,7 +1186,7 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
     router_publish(&router_outputs[output][0], &merged);
 
     // Notify tap if registered (for push-based outputs like UART)
-    if (output_taps[output]) {
+    if (output_taps[output] && merged_valid) {
         // TRACE: confirm we're actually handing the merged event to USB
         printf(LOG_TAG "  → tap → usbd: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
                merged.analog[ANALOG_LX], merged.analog[ANALOG_LY],
