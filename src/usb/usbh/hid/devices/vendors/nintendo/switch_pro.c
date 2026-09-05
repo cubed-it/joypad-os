@@ -340,6 +340,29 @@ void input_report_switch_pro(uint8_t dev_addr, uint8_t instance, uint8_t const* 
       uint8_t bat_level = (bat_raw > 8) ? 100 : bat_raw * 12 + 5;
       bool bat_charging = (update_report.battery_level_and_connection_info & 0x08) != 0;
 
+      // Per-event field-ownership mask (see input_event.h). For the
+      // Joy-Con Charging Grip (PID 0x200e), each HID instance only
+      // carries one side's stick data — the other side's shared_analog
+      // slot is still populated from the partner's last update, but
+      // that value can be stale (e.g. 128/centered) when the partner
+      // hasn't reported yet. Setting valid_fields to only the owned
+      // stick tells the router to preserve the partner's contribution
+      // rather than letting the stale fill win the "furthest from
+      // center" rule in MERGE_BLEND. Pro Controllers own every stick
+      // and fall back to 0 (legacy "all valid").
+      uint32_t valid_fields;
+      if (switch_devices[dev_addr].is_pro) {
+        valid_fields = 0;
+      } else if (switch_devices[dev_addr].grip_side[instance] == 0) {
+        valid_fields = INPUT_VALID_BUTTONS | INPUT_VALID_L_STICK;
+      } else if (switch_devices[dev_addr].grip_side[instance] == 1) {
+        valid_fields = INPUT_VALID_BUTTONS | INPUT_VALID_R_STICK;
+      } else {
+        // Side not yet detected on first report — don't drop data,
+        // behave as a full device until the second report classifies.
+        valid_fields = 0;
+      }
+
       // Update this side's shared analog state. For grip mode, only one
       // side has stick data per report — leftX/Y are non-zero for left
       // Joy-Con reports, rightX/Y for right. Standalone Pro Controller
@@ -368,7 +391,9 @@ void input_report_switch_pro(uint8_t dev_addr, uint8_t instance, uint8_t const* 
       // controller and let the router's MERGE mode combine them at the
       // output. We populate ALL four analog axes from shared_analog so
       // the router's per-event overwrite preserves the other side's
-      // stick state instead of zeroing it.
+      // stick state instead of zeroing it. The valid_fields mask
+      // computed above prevents the non-physical side's "no data"
+      // value (0/max) from clobbering the partner's real stick.
       input_event_t event = {
         .dev_addr = dev_addr,
         .instance = instance,
@@ -376,6 +401,7 @@ void input_report_switch_pro(uint8_t dev_addr, uint8_t instance, uint8_t const* 
         .transport = INPUT_TRANSPORT_USB,
         .buttons = buttons,
         .button_count = 10,  // B, A, Y, X, L, R, ZL, ZR, L3, R3
+        .valid_fields = valid_fields,
         .analog = {
           switch_devices[dev_addr].shared_analog[0],
           switch_devices[dev_addr].shared_analog[1],
