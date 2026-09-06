@@ -878,12 +878,32 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
 
     // TRACE: log every event arriving at the merge so we can correlate
     // with the BT driver's per-event prints and the USB output stream.
-    printf(LOG_TAG "  → merge entry: dev=%d inst=%d mask=0x%X "
-           "LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
-           event->dev_addr, event->instance, event->valid_fields,
-           event->analog[ANALOG_LX], event->analog[ANALOG_LY],
-           event->analog[ANALOG_RX], event->analog[ANALOG_RY],
-           (unsigned long)event->buttons);
+    // Throttled to ~1 Hz per device so the printf doesn't starve the
+    // CDC command loop when two Joy-Cons run at 66 Hz each.
+    {
+        static uint32_t trace_count[8] = {0};
+        static uint8_t  trace_last_dev[8] = {0};
+        static bool     trace_init = false;
+        if (!trace_init) { memset(trace_count, 0, sizeof(trace_count)); memset(trace_last_dev, 0, sizeof(trace_last_dev)); trace_init = true; }
+        uint8_t tslot = (uint8_t)(event->dev_addr & 7);
+        bool print_now = false;
+        if (trace_last_dev[tslot] != event->dev_addr) {
+            // New device — print first event immediately so we see it
+            print_now = true;
+            trace_last_dev[tslot] = (uint8_t)event->dev_addr;
+            trace_count[tslot] = 0;
+        } else if ((trace_count[tslot]++ & 63) == 0) {
+            print_now = true;
+        }
+        if (print_now) {
+            printf(LOG_TAG "  → merge entry: dev=%d inst=%d mask=0x%X "
+                   "LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+                   event->dev_addr, event->instance, event->valid_fields,
+                   event->analog[ANALOG_LX], event->analog[ANALOG_LY],
+                   event->analog[ANALOG_RX], event->analog[ANALOG_RY],
+                   (unsigned long)event->buttons);
+        }
+    }
 
     // Build the merged result in a local, then publish once (seqlock) so Core 1
     // never sees a torn frame mid-blend. See output_state_t doc in router.h.
@@ -956,14 +976,22 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                 // Update this device's state
                 blend_devices[output][slot].state = *final_event;
 
-                // TRACE: slot update
-                printf(LOG_TAG "  → blend slot[%d]: dev=%d inst=%d mask=0x%X "
-                       "LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
-                       slot, final_event->dev_addr, final_event->instance,
-                       final_event->valid_fields,
-                       final_event->analog[ANALOG_LX], final_event->analog[ANALOG_LY],
-                       final_event->analog[ANALOG_RX], final_event->analog[ANALOG_RY],
-                       (unsigned long)final_event->buttons);
+                // TRACE: slot update (throttled — same scheme as merge entry)
+                {
+                    static uint32_t slot_trace_count[8] = {0};
+                    static bool slot_trace_init = false;
+                    if (!slot_trace_init) { memset(slot_trace_count, 0, sizeof(slot_trace_count)); slot_trace_init = true; }
+                    uint8_t sts = (uint8_t)(final_event->dev_addr & 7);
+                    if ((slot_trace_count[sts]++ & 63) == 0) {
+                        printf(LOG_TAG "  → blend slot[%d]: dev=%d inst=%d mask=0x%X "
+                               "LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+                               slot, final_event->dev_addr, final_event->instance,
+                               final_event->valid_fields,
+                               final_event->analog[ANALOG_LX], final_event->analog[ANALOG_LY],
+                               final_event->analog[ANALOG_RX], final_event->analog[ANALOG_RY],
+                               (unsigned long)final_event->buttons);
+                    }
+                }
 
                 // Now re-blend ALL active devices into a local, published below
 
@@ -979,12 +1007,18 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
 
                     input_event_t* dev = &blend_devices[output][i].state;
 
-                    // TRACE: which slots the merge iterates over
-                    printf(LOG_TAG "    blend[%d]: dev=%d inst=%d mask=0x%X "
-                           "LX=%3d LY=%3d RX=%3d RY=%3d\n",
-                           i, dev->dev_addr, dev->instance, dev->valid_fields,
-                           dev->analog[ANALOG_LX], dev->analog[ANALOG_LY],
-                           dev->analog[ANALOG_RX], dev->analog[ANALOG_RY]);
+                    // TRACE: which slots the merge iterates over (heavily throttled — this
+                    // inner loop runs once per active device per event).
+                    {
+                        static uint32_t inner_trace = 0;
+                        if ((inner_trace++ & 255) == 0) {
+                            printf(LOG_TAG "    blend[%d]: dev=%d inst=%d mask=0x%X "
+                                   "LX=%3d LY=%3d RX=%3d RY=%3d\n",
+                                   i, dev->dev_addr, dev->instance, dev->valid_fields,
+                                   dev->analog[ANALOG_LX], dev->analog[ANALOG_LY],
+                                   dev->analog[ANALOG_RX], dev->analog[ANALOG_RY]);
+                        }
+                    }
 
                     // Buttons: OR together (active-high, 1 = pressed)
                     x_current_state.buttons |= dev->buttons;
@@ -1157,11 +1191,16 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
                 merged = x_current_state;
                 merged_valid = true;
 
-                // TRACE: final merged result before publish
-                printf(LOG_TAG "  → merge result: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
-                       merged.analog[ANALOG_LX], merged.analog[ANALOG_LY],
-                       merged.analog[ANALOG_RX], merged.analog[ANALOG_RY],
-                       (unsigned long)merged.buttons);
+                // TRACE: final merged result before publish (throttled)
+                {
+                    static uint32_t result_trace = 0;
+                    if ((result_trace++ & 63) == 0) {
+                        printf(LOG_TAG "  → merge result: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+                               merged.analog[ANALOG_LX], merged.analog[ANALOG_LY],
+                               merged.analog[ANALOG_RX], merged.analog[ANALOG_RY],
+                               (unsigned long)merged.buttons);
+                    }
+                }
             }
             break;
         }
@@ -1188,10 +1227,17 @@ static inline void router_merge_mode(const input_event_t* event, output_target_t
     // Notify tap if registered (for push-based outputs like UART)
     if (output_taps[output] && merged_valid) {
         // TRACE: confirm we're actually handing the merged event to USB
-        printf(LOG_TAG "  → tap → usbd: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
-               merged.analog[ANALOG_LX], merged.analog[ANALOG_LY],
-               merged.analog[ANALOG_RX], merged.analog[ANALOG_RY],
-               (unsigned long)merged.buttons);
+        // (throttled — fires once per 64 events so the UART doesn't
+        // starve CDC command processing)
+        {
+            static uint32_t tap_trace = 0;
+            if ((tap_trace++ & 63) == 0) {
+                printf(LOG_TAG "  → tap → usbd: LX=%3d LY=%3d RX=%3d RY=%3d btn=0x%08lX\n",
+                       merged.analog[ANALOG_LX], merged.analog[ANALOG_LY],
+                       merged.analog[ANALOG_RX], merged.analog[ANALOG_RY],
+                       (unsigned long)merged.buttons);
+            }
+        }
         output_taps[output](output, 0, &merged);
     }
 }
