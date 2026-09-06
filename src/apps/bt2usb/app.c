@@ -411,6 +411,18 @@ void app_init(void)
     };
     router_init(&router_cfg);
 
+    // Force NORMAL d-pad mode for this app. router_init() restores
+    // flash_data.dpad_mode which can be 1 or 2 from a previous SELECT+D-pad
+    // hotkey press — mode 2 (D-Pad ↔ Right Stick swap) silently maps
+    // every R stick motion into d-pad bits and resets RX/RY to 128, which
+    // looks like "merged RX/RY stuck" and "spurious DD/DL lit". The
+    // global_dpad_mode transform was originally meant for adapters that
+    // have no right stick; with two real Joy-Cons feeding a real stick
+    // output, it's actively destructive. Reset it here and persist
+    // the cleared value so a single flash write doesn't re-introduce it.
+    router_set_dpad_mode(0);
+    flash_set_dpad_mode(0);
+
     // Add default route: BLE Central → USB Device
     router_add_route(INPUT_SOURCE_BLE_CENTRAL, OUTPUT_TARGET_USB_DEVICE, 0);
 
